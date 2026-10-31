@@ -14465,6 +14465,32 @@ static void d3d12_draw_arrays_impl(void* ud, u32 primitive, u32 first, u32 count
     }
 }
 
+/* Indexed LINE_STRIP, expanded to a line list -- the indexed counterpart of
+ * upload_linestrip_vp above. Previously unhandled in d3d12_draw_indexed_impl
+ * (logged as "skipping prim=4 (not wired)" and dropped outright), so whatever
+ * geometry a title submits this way via DRAW_INDEX_ARRAY never reached the
+ * screen. Code Veronica submits indexed line-strip draws during room load;
+ * dropping them is one explanation for geometry that should composite behind
+ * the character (or otherwise use this path) failing to draw at all. */
+static u32 upload_linestrip_vp_indexed(const rsx_state* state, u32 first, u32 count)
+{
+    VP_FETCH_BEGIN();
+    extern uint8_t* vm_base;
+    if (!state || !vm_base || !s_d3d.vp_vb_mapped || count < 2) return 0;
+    if (!state->vertex_attribs[0].enabled) return 0;
+    u32 out_n = (count - 1) * 2;
+    u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    if (out_n > maxv) { s_drop_draws++; return 0; }
+    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+    for (u32 k = 0; k + 1 < count; k++) {
+        read_vp_vertex(state, read_guest_index(state, first + k),     &out[(2*k)   * 16]);
+        read_vp_vertex(state, read_guest_index(state, first + k + 1), &out[(2*k+1) * 16]);
+    }
+    s_d3d.vp_vb_offset += out_n * VP_VERT_STRIDE;
+    return out_n;
+}
+
 static void d3d12_draw_indexed_impl(void* ud, u32 primitive, u32 first, u32 count);
 static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
 {
@@ -14546,6 +14572,7 @@ static void d3d12_draw_indexed_impl(void* ud, u32 primitive, u32 first, u32 coun
     else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0, 0);
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN)   emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1, 0);
+    else if (primitive == RSX_PRIMITIVE_LINE_STRIP)     emitted = upload_linestrip_vp_indexed(s_d3d.current_rsx_state, first, count);
     else {
         ps3_tl_end(8);
         static int _skip = 0;
@@ -14576,7 +14603,11 @@ static void d3d12_draw_indexed_impl(void* ud, u32 primitive, u32 first, u32 coun
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
         dr->vertex_count   = emitted;
-        dr->topology       = RSX_TOPOLOGY_TRIANGLES;
+        /* LINE_STRIP is expanded above into a line list (see
+         * upload_linestrip_vp_indexed), same as the non-indexed path does for
+         * is_line; everything else here is expanded into a triangle list. */
+        dr->topology       = (primitive == RSX_PRIMITIVE_LINE_STRIP) ? RSX_TOPOLOGY_LINES
+                                                                      : RSX_TOPOLOGY_TRIANGLES;
         dr->textured       = s_d3d.tex_bound;
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
